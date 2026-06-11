@@ -226,6 +226,32 @@ simulasi.post('/submit', async (c) => {
   }
 });
 
+// 4b. Ambil Hasil Ujian Siswa (Aman): GET /api/simulasi/submission/:packageId/:studentId
+simulasi.get('/submission/:packageId/:studentId', async (c) => {
+  try {
+    const packageId = c.req.param('packageId');
+    const studentId = c.req.param('studentId');
+
+    const submission = await c.env.DB.prepare(
+      `SELECT score_mcq, score_essay, answers_json, analysis_json, submitted_at 
+       FROM simulasi_submissions 
+       WHERE student_id = ? AND package_id = ?`
+    ).bind(studentId, packageId).first();
+
+    if (!submission) {
+      return c.json({ error: 'Hasil pengerjaan tidak ditemukan' }, 404);
+    }
+
+    return c.json({
+      success: true,
+      submission
+    }, 200);
+
+  } catch (err) {
+    return c.json({ error: 'Gagal mengambil hasil ujian', details: err.message }, 500);
+  }
+});
+
 // 5. Proxy AI Chat Isa (Gemini): POST /api/simulasi/chat-isa
 simulasi.post('/chat-isa', async (c) => {
   try {
