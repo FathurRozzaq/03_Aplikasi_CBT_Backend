@@ -252,6 +252,49 @@ simulasi.get('/submission/:packageId/:studentId', async (c) => {
   }
 });
 
+// 4c. Ambil Pembahasan & Kunci Soal (Aman & Terkunci): GET /api/simulasi/discussion/:packageId/:sessionId
+simulasi.get('/discussion/:packageId/:sessionId', async (c) => {
+  try {
+    const packageId = c.req.param('packageId');
+    const sessionId = c.req.param('sessionId');
+
+    // A. Validasi Sesi: Pastikan sesi sudah submitted
+    const session = await c.env.DB.prepare(
+      'SELECT status FROM simulasi_sessions WHERE id = ? AND package_id = ?'
+    ).bind(sessionId, packageId).first();
+
+    if (!session || session.status !== 'submitted') {
+      return c.json({ error: 'Akses ditolak. Sesi belum dikirim/selesai.' }, 403);
+    }
+
+    // B. Validasi Pembahasan: Pastikan sudah dibuka oleh admin
+    const packageData = await c.env.DB.prepare(
+      'SELECT id, title, subject, questions_json, discussion_open FROM packages WHERE id = ?'
+    ).bind(packageId).first();
+
+    if (!packageData) {
+      return c.json({ error: 'Paket simulasi tidak ditemukan' }, 404);
+    }
+
+    if (packageData.discussion_open !== 1 && packageData.discussion_open !== true) {
+      return c.json({ error: 'Pembahasan belum dibuka oleh admin.', discussionOpen: false }, 403);
+    }
+
+    const questions = JSON.parse(packageData.questions_json || '[]');
+
+    return c.json({
+      success: true,
+      id: packageData.id,
+      title: packageData.title,
+      subject: packageData.subject,
+      questions
+    }, 200);
+
+  } catch (err) {
+    return c.json({ error: 'Gagal memuat pembahasan', details: err.message }, 500);
+  }
+});
+
 // 5. Proxy AI Chat Isa (Gemini): POST /api/simulasi/chat-isa
 simulasi.post('/chat-isa', async (c) => {
   try {
