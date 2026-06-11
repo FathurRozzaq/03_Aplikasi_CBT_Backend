@@ -8,6 +8,6 @@ compatibility_date = "2024-03-11"
 [[d1_databases]]
 binding = "DB"
 database_name = "umdipo-cbt-db"
-database_id = "PLACEHOLDER_DATABASE_ID" # Diisi manual oleh pengguna setelah D1 dibuat
+database_id = "aa89c6cd-4c84-4544-90a1-5de837e57020" # Diisi manual oleh pengguna setelah D1 dibuat
 
 # Configuration to allow CORS and other options if needed

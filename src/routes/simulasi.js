@@ -82,6 +82,51 @@ simulasi.get('/session/:sessionId', async (c) => {
   }
 });
 
+// 2b. Ambil Soal Ujian (Hanya jika sesi aktif & Sembunyikan Kunci Jawaban): GET /api/simulasi/questions/:packageId/:sessionId
+simulasi.get('/questions/:packageId/:sessionId', async (c) => {
+  try {
+    const packageId = c.req.param('packageId');
+    const sessionId = c.req.param('sessionId');
+
+    // Pastikan sesi masih aktif/ongoing
+    const session = await c.env.DB.prepare(
+      'SELECT id FROM simulasi_sessions WHERE id = ? AND package_id = ? AND status = "ongoing"'
+    ).bind(sessionId, packageId).first();
+
+    if (!session) {
+      return c.json({ error: 'Akses ditolak. Sesi tidak aktif atau sudah selesai dikerjakan.' }, 403);
+    }
+
+    const packageData = await c.env.DB.prepare(
+      'SELECT id, title, subject, duration, questions_json FROM packages WHERE id = ?'
+    ).bind(packageId).first();
+
+    if (!packageData) {
+      return c.json({ error: 'Paket simulasi tidak ditemukan' }, 404);
+    }
+
+    const questions = JSON.parse(packageData.questions_json || '[]');
+
+    // Sembunyikan correct_answer dan explanation saat pengerjaan agar aman dari inspect element
+    const clientQuestions = questions.map((q) => {
+      const { correct_answer, explanation, ...rest } = q;
+      return rest;
+    });
+
+    return c.json({
+      success: true,
+      id: packageData.id,
+      title: packageData.title,
+      subject: packageData.subject,
+      duration: packageData.duration,
+      questions: clientQuestions
+    }, 200);
+
+  } catch (err) {
+    return c.json({ error: 'Gagal memuat soal ujian', details: err.message }, 500);
+  }
+});
+
 // 3. Laporkan Pelanggaran: POST /api/simulasi/violation
 simulasi.post('/violation', async (c) => {
   try {
