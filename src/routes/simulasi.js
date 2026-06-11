@@ -1,0 +1,359 @@
+import { Hono } from 'hono';
+
+const simulasi = new Hono();
+
+// ==========================================
+// PORTAL PESERTA (STUDENT PORTAL)
+// ==========================================
+
+// 1. Mulai Ujian: POST /api/simulasi/start
+simulasi.post('/start', async (c) => {
+  try {
+    const { studentId, packageId } = await c.req.json();
+    const now = Math.floor(Date.now() / 1000);
+
+    if (!studentId || !packageId) {
+      return c.json({ error: 'Student ID dan Package ID wajib diisi' }, 400);
+    }
+
+    // A. Ambil jadwal ujian paket
+    const packageData = await c.env.DB.prepare(
+      'SELECT scheduled_start, scheduled_end FROM packages WHERE id = ? AND app_type = "simulasi"'
+    ).bind(packageId).first();
+
+    if (!packageData) {
+      return c.json({ error: 'Paket simulasi tidak ditemukan' }, 404);
+    }
+
+    // B. Verifikasi rentang waktu pengerjaan
+    if (packageData.scheduled_start && now < packageData.scheduled_start) {
+      return c.json({ error: 'Ujian simulasi belum dimulai' }, 400);
+    }
+
+    if (packageData.scheduled_end && now > packageData.scheduled_end) {
+      return c.json({ error: 'Ujian simulasi sudah berakhir/ditutup' }, 400);
+    }
+
+    // C. Cek apakah sesi sudah pernah dibuat
+    const existingSession = await c.env.DB.prepare(
+      'SELECT id, status FROM simulasi_sessions WHERE student_id = ? AND package_id = ?'
+    ).bind(studentId, packageId).first();
+
+    if (existingSession) {
+      if (existingSession.status === 'submitted') {
+        return c.json({ error: 'Anda sudah pernah menyelesaikan paket simulasi ini. Batas pengerjaan 1x.' }, 403);
+      }
+      // Jika masih ongoing, kembalikan sesi yang ada (reload recovery)
+      return c.json({ sessionId: existingSession.id, status: 'ongoing' }, 200);
+    }
+
+    // D. Buat sesi baru
+    const sessionId = crypto.randomUUID();
+    await c.env.DB.prepare(
+      'INSERT INTO simulasi_sessions (id, student_id, package_id, status, started_at) VALUES (?, ?, ?, "ongoing", ?)'
+    ).bind(sessionId, studentId, packageId, now).run();
+
+    return c.json({ sessionId, status: 'ongoing' }, 201);
+
+  } catch (err) {
+    return c.json({ error: 'Gagal memulai sesi ujian', details: err.message }, 500);
+  }
+});
+
+// 2. Pemulihan Sesi (Reload Recovery): GET /api/simulasi/session/:sessionId
+simulasi.get('/session/:sessionId', async (c) => {
+  try {
+    const sessionId = c.req.param('sessionId');
+
+    const session = await c.env.DB.prepare(
+      `SELECT ss.id, ss.student_id, ss.package_id, ss.status, ss.tab_switch_count, ss.started_at, p.duration, p.title
+       FROM simulasi_sessions ss
+       JOIN packages p ON ss.package_id = p.id
+       WHERE ss.id = ?`
+    ).bind(sessionId).first();
+
+    if (!session) {
+      return c.json({ error: 'Sesi ujian tidak ditemukan' }, 404);
+    }
+
+    return c.json({ success: true, session }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal memuat sesi', details: err.message }, 500);
+  }
+});
+
+// 3. Laporkan Pelanggaran: POST /api/simulasi/violation
+simulasi.post('/violation', async (c) => {
+  try {
+    const { sessionId } = await c.req.json();
+
+    if (!sessionId) {
+      return c.json({ error: 'Session ID wajib diisi' }, 400);
+    }
+
+    const result = await c.env.DB.prepare(
+      'UPDATE simulasi_sessions SET tab_switch_count = tab_switch_count + 1 WHERE id = ? AND status = "ongoing"'
+    ).bind(sessionId).run();
+
+    return c.json({ success: true, changes: result.meta.changes }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal mencatat pelanggaran', details: err.message }, 500);
+  }
+});
+
+// 4. Kirim Ujian & Penilaian Pilihan Ganda: POST /api/simulasi/submit
+simulasi.post('/submit', async (c) => {
+  try {
+    const { studentId, packageId, sessionId, answers } = await c.req.json();
+    const now = Math.floor(Date.now() / 1000);
+
+    if (!studentId || !packageId || !sessionId || !answers) {
+      return c.json({ error: 'Data pengerjaan tidak lengkap' }, 400);
+    }
+
+    // A. Ambil butir soal dari database
+    const packageData = await c.env.DB.prepare(
+      'SELECT questions_json FROM packages WHERE id = ? AND app_type = "simulasi"'
+    ).bind(packageId).first();
+
+    if (!packageData) {
+      return c.json({ error: 'Paket simulasi tidak ditemukan' }, 404);
+    }
+
+    const questions = JSON.parse(packageData.questions_json || '[]');
+    let correctMcqCount = 0;
+    let totalMcqCount = 0;
+    const analysis = {}; // Akurasi per subtopik: { [subtopic]: { correct: 0, total: 0 } }
+
+    // B. Hitung skor MCQ dan kumpulkan analisis subtopik
+    questions.forEach((q) => {
+      const subtopic = q.subtopic || 'Umum';
+      const isMcq = q.type === 'mcq' || !q.type;
+      const studentAnswer = answers[q.id] || '';
+
+      if (!analysis[subtopic]) {
+        analysis[subtopic] = { correct: 0, total: 0 };
+      }
+      analysis[subtopic].total += 1;
+
+      if (isMcq) {
+        totalMcqCount += 1;
+        if (studentAnswer.toString().toUpperCase() === q.correct_answer.toString().toUpperCase()) {
+          correctMcqCount += 1;
+          analysis[subtopic].correct += 1;
+        }
+      }
+    });
+
+    const scoreMcq = totalMcqCount > 0 ? (correctMcqCount / totalMcqCount) * 100 : 0;
+    const submissionId = `${studentId}_${packageId}`;
+
+    // C. Simpan ke Database (Batch Transaction)
+    await c.env.DB.batch([
+      // Update status sesi
+      c.env.DB.prepare(
+        'UPDATE simulasi_sessions SET status = "submitted", submitted_at = ? WHERE id = ?'
+      ).bind(now, sessionId),
+      // Simpan berkas hasil ujian
+      c.env.DB.prepare(
+        `INSERT OR REPLACE INTO simulasi_submissions 
+         (id, student_id, package_id, score_mcq, score_essay, answers_json, analysis_json, submitted_at) 
+         VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`
+      ).bind(
+        submissionId,
+        studentId,
+        packageId,
+        scoreMcq,
+        JSON.stringify(answers),
+        JSON.stringify(analysis),
+        now
+      )
+    ]);
+
+    return c.json({
+      success: true,
+      scoreMcq,
+      analysis
+    }, 200);
+
+  } catch (err) {
+    return c.json({ error: 'Gagal mengumpulkan lembar jawaban', details: err.message }, 500);
+  }
+});
+
+// 5. Proxy AI Chat Isa (Gemini): POST /api/simulasi/chat-isa
+simulasi.post('/chat-isa', async (c) => {
+  try {
+    const { studentId, sessionId, message } = await c.req.json();
+    const today = new Date().toISOString().split('T')[0];
+
+    if (!studentId || !sessionId || !message) {
+      return c.json({ error: 'Payload tidak lengkap' }, 400);
+    }
+
+    // A. Validasi Sesi: Pastikan user sudah menyelesaikan ujian
+    const session = await c.env.DB.prepare(
+      'SELECT status FROM simulasi_sessions WHERE id = ?'
+    ).bind(sessionId).first();
+
+    if (!session || session.status !== 'submitted') {
+      return c.json({ error: 'AI Chat pembahasan hanya terbuka setelah ujian Anda dikirimkan' }, 403);
+    }
+
+    // B. Cek Quota limit harian (120/hari)
+    let chatHistory = await c.env.DB.prepare(
+      'SELECT id, messages_json, daily_count, last_reset_date FROM simulasi_chat_histories WHERE student_id = ? AND session_id = ?'
+    ).bind(studentId, sessionId).first();
+
+    let dailyCount = 0;
+    let messages = [];
+
+    if (chatHistory) {
+      if (chatHistory.last_reset_date === today) {
+        dailyCount = chatHistory.daily_count;
+      } else {
+        dailyCount = 0;
+      }
+
+      if (dailyCount >= 120) {
+        return c.json({ error: 'Batas kuota harian Anda (120 chat/hari) untuk asisten Isa telah habis' }, 429);
+      }
+      messages = JSON.parse(chatHistory.messages_json || '[]');
+    }
+
+    // C. Panggil Gemini API Pro via HTTP Fetch
+    const systemPrompt = 'Anda adalah Isa, asisten virtual ramah untuk platform CBT UMDipo. Tugas Anda membantu menerangkan pembahasan soal simulasi ujian ini secara runut, ramah, dan mendidik. Gunakan format Markdown untuk penulisan matematika / rumus jika diperlukan.';
+    const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${c.env.GEMINI_API_KEY}`;
+
+    const contents = [
+      { role: 'user', parts: [{ text: systemPrompt }] },
+      ...messages.map(m => ({
+        role: m.sender === 'user' ? 'user' : 'model',
+        parts: [{ text: m.text }]
+      })),
+      { role: 'user', parts: [{ text: message }] }
+    ];
+
+    const response = await fetch(geminiEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents })
+    });
+
+    const data = await response.json();
+    const botReply = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Maaf, sistem asisten Isa sedang mengalami kendala. Coba beberapa saat lagi.';
+
+    // D. Simpan Riwayat Baru ke D1
+    messages.push({ sender: 'user', text: message, timestamp: Date.now() });
+    messages.push({ sender: 'isa', text: botReply, timestamp: Date.now() });
+    dailyCount += 1;
+
+    if (chatHistory) {
+      await c.env.DB.prepare(
+        `UPDATE simulasi_chat_histories 
+         SET messages_json = ?, daily_count = ?, last_reset_date = ?, updated_at = ? 
+         WHERE id = ?`
+      ).bind(JSON.stringify(messages), dailyCount, today, Math.floor(Date.now() / 1000), chatHistory.id).run();
+    } else {
+      await c.env.DB.prepare(
+        `INSERT INTO simulasi_chat_histories 
+         (student_id, session_id, messages_json, daily_count, last_reset_date, updated_at) 
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(studentId, sessionId, JSON.stringify(messages), dailyCount, today, Math.floor(Date.now() / 1000)).run();
+    }
+
+    return c.json({ reply: botReply }, 200);
+
+  } catch (err) {
+    return c.json({ error: 'Gagal menghubungi asisten virtual Isa', details: err.message }, 500);
+  }
+});
+
+// ==========================================
+// PORTAL ADMIN (ADMIN PORTAL)
+// ==========================================
+
+// 6. Ambil Daftar Paket Simulasi: GET /api/simulasi/admin/packages
+simulasi.get('/admin/packages', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, title, subject, duration, questions_count, is_active, scheduled_start, scheduled_end, discussion_open FROM packages WHERE app_type = "simulasi"'
+    ).all();
+
+    return c.json(results, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal memuat paket soal simulasi', details: err.message }, 500);
+  }
+});
+
+// 7. Edit Jadwal Ujian: PATCH /api/simulasi/admin/packages/:id/schedule
+simulasi.patch('/admin/packages/:id/schedule', async (c) => {
+  try {
+    const packageId = c.req.param('id');
+    const { scheduledStart, scheduledEnd } = await c.req.json(); // UNIX Timestamp (INTEGER)
+
+    await c.env.DB.prepare(
+      'UPDATE packages SET scheduled_start = ?, scheduled_end = ? WHERE id = ? AND app_type = "simulasi"'
+    ).bind(scheduledStart, scheduledEnd, packageId).run();
+
+    return c.json({ success: true }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal memperbarui jadwal', details: err.message }, 500);
+  }
+});
+
+// 8. Buka/Tutup Pembahasan: PATCH /api/simulasi/admin/packages/:id/discussion
+simulasi.patch('/admin/packages/:id/discussion', async (c) => {
+  try {
+    const packageId = c.req.param('id');
+    const { discussionOpen } = await c.req.json(); // 0 = Tutup, 1 = Buka
+
+    await c.env.DB.prepare(
+      'UPDATE packages SET discussion_open = ? WHERE id = ? AND app_type = "simulasi"'
+    ).bind(discussionOpen, packageId).run();
+
+    return c.json({ success: true }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal mengubah status pembahasan', details: err.message }, 500);
+  }
+});
+
+// 9. Live Monitoring Pengawasan: GET /api/simulasi/admin/sessions/:packageId
+simulasi.get('/admin/sessions/:packageId', async (c) => {
+  try {
+    const packageId = c.req.param('packageId');
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT s.nama, s.nomor_wa, ss.status, ss.tab_switch_count, ss.started_at, ss.submitted_at
+       FROM simulasi_sessions ss
+       JOIN students s ON ss.student_id = s.id
+       WHERE ss.package_id = ?
+       ORDER BY ss.started_at DESC`
+    ).bind(packageId).all();
+
+    return c.json(results, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal memuat log live monitoring', details: err.message }, 500);
+  }
+});
+
+// 10. Unduh Hasil Nilai Lengkap (Ekspor): GET /api/simulasi/admin/submissions/:packageId
+simulasi.get('/admin/submissions/:packageId', async (c) => {
+  try {
+    const packageId = c.req.param('packageId');
+
+    const { results } = await c.env.DB.prepare(
+      `SELECT s.nama, s.nomor_wa, s.email, sub.score_mcq, sub.score_essay, sub.answers_json, sub.submitted_at
+       FROM simulasi_submissions sub
+       JOIN students s ON sub.student_id = s.id
+       WHERE sub.package_id = ?
+       ORDER BY sub.submitted_at DESC`
+    ).bind(packageId).all();
+
+    return c.json(results, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal mengekstrak hasil nilai simulasi', details: err.message }, 500);
+  }
+});
+
+export default simulasi;

@@ -1,0 +1,16 @@
+{
+  "name": "umdipo-cbt-backend",
+  "version": "1.0.0",
+  "description": "Shared backend for UMDipo CBT Web Tryout and Web Simulasi",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}

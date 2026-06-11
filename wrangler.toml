@@ -1,0 +1,13 @@
+name = "umdipo-cbt-backend"
+main = "src/index.js"
+compatibility_date = "2024-03-11"
+
+[vars]
+# Variabel lingkungan publik jika diperlukan
+
+[[d1_databases]]
+binding = "DB"
+database_name = "umdipo-cbt-db"
+database_id = "PLACEHOLDER_DATABASE_ID" # Diisi manual oleh pengguna setelah D1 dibuat
+
+# Configuration to allow CORS and other options if needed
