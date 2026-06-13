@@ -69,11 +69,13 @@ simulasi.get('/packages/:studentId', async (c) => {
 
     const { results } = await c.env.DB.prepare(
       `SELECT s.id, s.package_id, s.title, s.scheduled_start, s.discussion_open, s.participants_json,
-              p.subject, p.duration, p.questions_count, p.title AS package_title
+              p.subject, p.duration, p.questions_count, p.title AS package_title,
+              ss.status AS session_status, ss.id AS session_id
        FROM simulasi_schedules s
        JOIN packages p ON s.package_id = p.id
+       LEFT JOIN simulasi_sessions ss ON s.id = ss.schedule_id AND ss.student_id = ?
        WHERE p.is_active = 1`
-    ).all();
+    ).bind(studentId).all();
 
     const filteredResults = results.filter(sched => {
       try {
