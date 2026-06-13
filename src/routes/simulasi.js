@@ -432,7 +432,7 @@ simulasi.post('/chat-isa', async (c) => {
     ).bind(sessionId).first();
 
     if (!session || session.status !== 'submitted') {
-      return c.json({ error: 'AI Chat pembahasan hanya terbuka setelah ujian Anda dikirimkan' }, 403);
+      return c.json({ error: 'AI Chat pembahasan hanya terbuka setelah ujian kamu dikirimkan' }, 403);
     }
 
     // B. Cek Quota limit harian (120/hari)
@@ -451,14 +451,14 @@ simulasi.post('/chat-isa', async (c) => {
       }
 
       if (dailyCount >= 120) {
-        return c.json({ error: 'Batas kuota harian Anda (120 chat/hari) untuk asisten Isa telah habis' }, 429);
+        return c.json({ error: 'Batas kuota harian kamu (120 chat/hari) untuk asisten Isa telah habis' }, 429);
       }
       messages = JSON.parse(chatHistory.messages_json || '[]');
     }
 
     // C. Panggil Gemini API Pro via HTTP Fetch
     const systemInstructionText = 'Kamu adalah Isa, seorang tutor pendamping belajar yang santai, bersahabat, dan suportif untuk membantu peserta memahami pembahasan soal ujian. Jangan sebutkan kata "Gemini", "Google", "AI", atau "Asisten Virtual" di dalam penjelasanmu. Cukup panggil dirimu sebagai "Isa". Gunakan bahasa Indonesia yang santai, akrab, ramah, dan tidak formal/kaku (seperti mengobrol dengan teman dekat atau kakak tutor). PENTING: Jangan pernah menggunakan kata "Anda"! Selalu gunakan kata "kamu" untuk menyapa pengguna. Gunakan format Markdown untuk penulisan matematika / rumus jika diperlukan.';
-    const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${c.env.GEMINI_API_KEY}`;
+    const geminiEndpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
 
     const contents = [
       ...messages.map(m => ({
@@ -470,7 +470,10 @@ simulasi.post('/chat-isa', async (c) => {
 
     const response = await fetch(geminiEndpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'X-goog-api-key': c.env.GEMINI_API_KEY
+      },
       body: JSON.stringify({
         contents,
         systemInstruction: {
