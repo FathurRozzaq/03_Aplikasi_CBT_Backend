@@ -22,7 +22,7 @@ app.use('*', cors({
   },
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowHeaders: ['Content-Type', 'Authorization'],
-  exposeHeaders: ['Content-Length'],
+  exposeHeaders: ['Content-Length', 'Date'],
   maxAge: 600,
   credentials: true,
 }));
