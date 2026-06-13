@@ -435,24 +435,23 @@ simulasi.post('/chat-isa', async (c) => {
       return c.json({ error: 'AI Chat pembahasan hanya terbuka setelah ujian kamu dikirimkan' }, 403);
     }
 
-    // B. Cek Quota limit harian (120/hari)
+    // B. Cek Quota limit harian global siswa hari ini (50/hari)
+    const usageQuery = await c.env.DB.prepare(
+      'SELECT SUM(daily_count) AS total FROM simulasi_chat_histories WHERE student_id = ? AND last_reset_date = ?'
+    ).bind(studentId, today).first();
+    const totalToday = usageQuery?.total || 0;
+
+    if (totalToday >= 50) {
+      return c.json({ error: 'Batas kuota harian kamu (50 chat/hari) untuk asisten Isa telah habis' }, 429);
+    }
+
+    // Ambil riwayat pesan khusus sesi terkait
     let chatHistory = await c.env.DB.prepare(
       'SELECT id, messages_json, daily_count, last_reset_date FROM simulasi_chat_histories WHERE student_id = ? AND session_id = ?'
     ).bind(studentId, sessionId).first();
 
-    let dailyCount = 0;
     let messages = [];
-
     if (chatHistory) {
-      if (chatHistory.last_reset_date === today) {
-        dailyCount = chatHistory.daily_count;
-      } else {
-        dailyCount = 0;
-      }
-
-      if (dailyCount >= 120) {
-        return c.json({ error: 'Batas kuota harian kamu (120 chat/hari) untuk asisten Isa telah habis' }, 429);
-      }
       messages = JSON.parse(chatHistory.messages_json || '[]');
     }
 
@@ -488,20 +487,20 @@ simulasi.post('/chat-isa', async (c) => {
     // D. Simpan Riwayat Baru ke D1
     messages.push({ sender: 'user', text: message, timestamp: Date.now() });
     messages.push({ sender: 'isa', text: botReply, timestamp: Date.now() });
-    dailyCount += 1;
 
     if (chatHistory) {
+      const newCount = chatHistory.last_reset_date === today ? (chatHistory.daily_count + 1) : 1;
       await c.env.DB.prepare(
         `UPDATE simulasi_chat_histories 
          SET messages_json = ?, daily_count = ?, last_reset_date = ?, updated_at = ? 
          WHERE id = ?`
-      ).bind(JSON.stringify(messages), dailyCount, today, Math.floor(Date.now() / 1000), chatHistory.id).run();
+      ).bind(JSON.stringify(messages), newCount, today, Math.floor(Date.now() / 1000), chatHistory.id).run();
     } else {
       await c.env.DB.prepare(
         `INSERT INTO simulasi_chat_histories 
          (student_id, session_id, messages_json, daily_count, last_reset_date, updated_at) 
          VALUES (?, ?, ?, ?, ?, ?)`
-      ).bind(studentId, sessionId, JSON.stringify(messages), dailyCount, today, Math.floor(Date.now() / 1000)).run();
+      ).bind(studentId, sessionId, JSON.stringify(messages), 1, today, Math.floor(Date.now() / 1000)).run();
     }
 
     return c.json({ reply: botReply }, 200);
