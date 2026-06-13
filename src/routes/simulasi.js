@@ -347,9 +347,11 @@ simulasi.get('/submission/:scheduleId/:studentId', async (c) => {
     const studentId = c.req.param('studentId');
 
     const submission = await c.env.DB.prepare(
-      `SELECT score_mcq, score_essay, answers_json, analysis_json, submitted_at 
-       FROM simulasi_submissions 
-       WHERE student_id = ? AND schedule_id = ?`
+      `SELECT sub.score_mcq, sub.score_essay, sub.answers_json, sub.analysis_json, sub.submitted_at,
+              ss.id AS session_id
+       FROM simulasi_submissions sub
+       JOIN simulasi_sessions ss ON ss.schedule_id = sub.schedule_id AND ss.student_id = sub.student_id
+       WHERE sub.student_id = ? AND sub.schedule_id = ?`
     ).bind(studentId, scheduleId).first();
 
     if (!submission) {
