@@ -70,12 +70,14 @@ simulasi.get('/packages/:studentId', async (c) => {
     const { results } = await c.env.DB.prepare(
       `SELECT s.id, s.package_id, s.title, s.scheduled_start, s.discussion_open, s.participants_json,
               p.subject, p.duration, p.questions_count, p.title AS package_title,
-              ss.status AS session_status, ss.id AS session_id
+              ss.status AS session_status, ss.id AS session_id,
+              sub.score_mcq
        FROM simulasi_schedules s
        JOIN packages p ON s.package_id = p.id
        LEFT JOIN simulasi_sessions ss ON s.id = ss.schedule_id AND ss.student_id = ?
+       LEFT JOIN simulasi_submissions sub ON sub.schedule_id = s.id AND sub.student_id = ?
        WHERE p.is_active = 1`
-    ).bind(studentId).all();
+    ).bind(studentId, studentId).all();
 
     const filteredResults = results.filter(sched => {
       try {
@@ -657,11 +659,46 @@ simulasi.patch('/admin/schedules/:id', async (c) => {
 // 10. Hapus Jadwal Ujian: DELETE /api/simulasi/admin/schedules/:id
 simulasi.delete('/admin/schedules/:id', async (c) => {
   try {
-    const id = c.req.param('id');
-    await c.env.DB.prepare('DELETE FROM simulasi_schedules WHERE id = ?').bind(id).run();
+    const scheduleId = c.req.param('id');
+
+    // 1. Ambil daftar session_id yang terikat dengan scheduleId ini untuk menghapus chat_histories
+    const sessions = await c.env.DB.prepare(
+      'SELECT id FROM simulasi_sessions WHERE schedule_id = ?'
+    ).bind(scheduleId).all();
+    const sessionIds = (sessions.results || []).map(s => s.id);
+
+    const batchStatements = [];
+
+    // 2. Jika ada sesi, buat statement hapus chat_histories
+    if (sessionIds.length > 0) {
+      sessionIds.forEach(sid => {
+        batchStatements.push(
+          c.env.DB.prepare('DELETE FROM simulasi_chat_histories WHERE session_id = ?').bind(sid)
+        );
+      });
+    }
+
+    // 3. Tambahkan statement hapus dari tabel simulasi_sessions
+    batchStatements.push(
+      c.env.DB.prepare('DELETE FROM simulasi_sessions WHERE schedule_id = ?').bind(scheduleId)
+    );
+
+    // 4. Tambahkan statement hapus dari tabel simulasi_submissions
+    batchStatements.push(
+      c.env.DB.prepare('DELETE FROM simulasi_submissions WHERE schedule_id = ?').bind(scheduleId)
+    );
+
+    // 5. Tambahkan statement hapus jadwal dari tabel simulasi_schedules
+    batchStatements.push(
+      c.env.DB.prepare('DELETE FROM simulasi_schedules WHERE id = ?').bind(scheduleId)
+    );
+
+    // Eksekusi batch transaction di D1
+    await c.env.DB.batch(batchStatements);
+
     return c.json({ success: true }, 200);
   } catch (err) {
-    return c.json({ error: 'Gagal menghapus jadwal', details: err.message }, 500);
+    return c.json({ error: 'Gagal menghapus jadwal dan data terkait', details: err.message }, 500);
   }
 });
 
