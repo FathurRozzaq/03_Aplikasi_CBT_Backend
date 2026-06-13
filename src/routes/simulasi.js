@@ -419,8 +419,8 @@ simulasi.get('/discussion/:scheduleId/:sessionId', async (c) => {
 // 5. Proxy AI Chat Isa (Gemini): POST /api/simulasi/chat-isa
 simulasi.post('/chat-isa', async (c) => {
   try {
-    const { studentId, sessionId, message } = await c.req.json();
-    const today = new Date().toISOString().split('T')[0];
+    const { studentId, sessionId, message, history } = await c.req.json();
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jakarta' });
 
     if (!studentId || !sessionId || !message) {
       return c.json({ error: 'Payload tidak lengkap' }, 400);
@@ -442,25 +442,20 @@ simulasi.post('/chat-isa', async (c) => {
     const totalToday = usageQuery?.total || 0;
 
     if (totalToday >= 50) {
-      return c.json({ error: 'Batas kuota harian kamu (50 chat/hari) untuk asisten Isa telah habis' }, 429);
+      return c.json({ error: 'Kuota chat kamu hari ini telah habis. Kuota akan direset besok pukul 00:00 WIB.' }, 429);
     }
 
-    // Ambil riwayat pesan khusus sesi terkait
+    // Ambil riwayat khusus sesi terkait untuk melacak daily_count
     let chatHistory = await c.env.DB.prepare(
-      'SELECT id, messages_json, daily_count, last_reset_date FROM simulasi_chat_histories WHERE student_id = ? AND session_id = ?'
+      'SELECT id, daily_count, last_reset_date FROM simulasi_chat_histories WHERE student_id = ? AND session_id = ?'
     ).bind(studentId, sessionId).first();
-
-    let messages = [];
-    if (chatHistory) {
-      messages = JSON.parse(chatHistory.messages_json || '[]');
-    }
 
     // C. Panggil Gemini API Pro via HTTP Fetch
     const systemInstructionText = 'Kamu adalah Isa, seorang tutor pendamping belajar yang santai, bersahabat, dan suportif untuk membantu peserta memahami pembahasan soal ujian. Jangan sebutkan kata "Gemini", "Google", "AI", atau "Asisten Virtual" di dalam penjelasanmu. Cukup panggil dirimu sebagai "Isa". Gunakan bahasa Indonesia yang santai, akrab, ramah, dan tidak formal/kaku (seperti mengobrol dengan teman dekat atau kakak tutor). PENTING: Jangan pernah menggunakan kata "Anda"! Selalu gunakan kata "kamu" untuk menyapa pengguna. Gunakan format Markdown untuk penulisan matematika / rumus jika diperlukan.';
     const geminiEndpoint = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent';
 
     const contents = [
-      ...messages.map(m => ({
+      ...(history || []).map(m => ({
         role: m.sender === 'user' ? 'user' : 'model',
         parts: [{ text: m.text }]
       })),
@@ -484,29 +479,80 @@ simulasi.post('/chat-isa', async (c) => {
     const data = await response.json();
     const botReply = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Maaf, sistem asisten Isa sedang mengalami kendala. Coba beberapa saat lagi.';
 
-    // D. Simpan Riwayat Baru ke D1
-    messages.push({ sender: 'user', text: message, timestamp: Date.now() });
-    messages.push({ sender: 'isa', text: botReply, timestamp: Date.now() });
-
+    // D. Update daily_count saja di D1 (tanpa update messages_json untuk hemat write)
     if (chatHistory) {
       const newCount = chatHistory.last_reset_date === today ? (chatHistory.daily_count + 1) : 1;
       await c.env.DB.prepare(
         `UPDATE simulasi_chat_histories 
-         SET messages_json = ?, daily_count = ?, last_reset_date = ?, updated_at = ? 
+         SET daily_count = ?, last_reset_date = ?, updated_at = ? 
          WHERE id = ?`
-      ).bind(JSON.stringify(messages), newCount, today, Math.floor(Date.now() / 1000), chatHistory.id).run();
+      ).bind(newCount, today, Math.floor(Date.now() / 1000), chatHistory.id).run();
     } else {
       await c.env.DB.prepare(
         `INSERT INTO simulasi_chat_histories 
          (student_id, session_id, messages_json, daily_count, last_reset_date, updated_at) 
          VALUES (?, ?, ?, ?, ?, ?)`
-      ).bind(studentId, sessionId, JSON.stringify(messages), 1, today, Math.floor(Date.now() / 1000)).run();
+      ).bind(studentId, sessionId, '[]', 1, today, Math.floor(Date.now() / 1000)).run();
     }
 
     return c.json({ reply: botReply }, 200);
 
   } catch (err) {
     return c.json({ error: 'Gagal menghubungi asisten virtual Isa', details: err.message }, 500);
+  }
+});
+
+// 5b. Simpan/Sinkronisasi Riwayat Chat (Batch): POST /api/simulasi/chat-save
+simulasi.post('/chat-save', async (c) => {
+  try {
+    const { studentId, sessionId, messages } = await c.req.json();
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jakarta' });
+
+    if (!studentId || !sessionId || !messages) {
+      return c.json({ error: 'Payload tidak lengkap' }, 400);
+    }
+
+    let chatHistory = await c.env.DB.prepare(
+      'SELECT id FROM simulasi_chat_histories WHERE student_id = ? AND session_id = ?'
+    ).bind(studentId, sessionId).first();
+
+    if (chatHistory) {
+      await c.env.DB.prepare(
+        `UPDATE simulasi_chat_histories 
+         SET messages_json = ?, updated_at = ? 
+         WHERE id = ?`
+      ).bind(JSON.stringify(messages), Math.floor(Date.now() / 1000), chatHistory.id).run();
+    } else {
+      await c.env.DB.prepare(
+        `INSERT INTO simulasi_chat_histories 
+         (student_id, session_id, messages_json, daily_count, last_reset_date, updated_at) 
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(studentId, sessionId, JSON.stringify(messages), 0, today, Math.floor(Date.now() / 1000)).run();
+    }
+
+    return c.json({ success: true }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal sinkronisasi chat', details: err.message }, 500);
+  }
+});
+
+// 5c. Ambil Riwayat Chat (Session-based): GET /api/simulasi/chat-history/:sessionId/:studentId
+simulasi.get('/chat-history/:sessionId/:studentId', async (c) => {
+  try {
+    const sessionId = c.req.param('sessionId');
+    const studentId = c.req.param('studentId');
+
+    const chatHistory = await c.env.DB.prepare(
+      'SELECT messages_json FROM simulasi_chat_histories WHERE student_id = ? AND session_id = ?'
+    ).bind(studentId, sessionId).first();
+
+    if (chatHistory && chatHistory.messages_json) {
+      return c.json({ messages: JSON.parse(chatHistory.messages_json) }, 200);
+    }
+
+    return c.json({ messages: [] }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal mengambil riwayat chat', details: err.message }, 500);
   }
 });
 
