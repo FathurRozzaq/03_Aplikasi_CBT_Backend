@@ -127,7 +127,9 @@ simulasi.post('/start', async (c) => {
     }
 
     // C. Verifikasi rentang waktu pengerjaan
-    if (schedule.scheduled_start && now < schedule.scheduled_start) {
+    // Grace period 60 detik untuk mengakomodasi residual clock drift antara client dan Cloudflare Workers
+    const GRACE_PERIOD_SECONDS = 60;
+    if (schedule.scheduled_start && now < (schedule.scheduled_start - GRACE_PERIOD_SECONDS)) {
       return c.json({ error: 'Ujian simulasi belum dimulai' }, 400);
     }
 
