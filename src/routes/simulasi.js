@@ -2,9 +2,90 @@ import { Hono } from 'hono';
 
 const simulasi = new Hono();
 
+// Helper to force submit expired sessions
+async function checkAndForceSubmit(db, session) {
+  if (!session || session.status !== 'ongoing') return session;
+
+  const now = Math.floor(Date.now() / 1000);
+  const totalDurationSeconds = session.duration * 60;
+  if (session.started_at + totalDurationSeconds < now) {
+    const packageId = session.package_id;
+    const studentId = session.student_id;
+    const sessionId = session.id;
+
+    // Fetch package to setup analysis subtopics
+    const packageData = await db.prepare(
+      'SELECT questions_json FROM packages WHERE id = ? AND app_type = "simulasi"'
+    ).bind(packageId).first();
+
+    let analysis = {};
+    if (packageData) {
+      const questions = JSON.parse(packageData.questions_json || '[]');
+      questions.forEach((q) => {
+        const subtopic = q.subtopic || 'Umum';
+        if (!analysis[subtopic]) {
+          analysis[subtopic] = { correct: 0, total: 0 };
+        }
+        analysis[subtopic].total += 1;
+      });
+    }
+
+    const submissionId = `${studentId}_${packageId}`;
+
+    await db.batch([
+      db.prepare(
+        'UPDATE simulasi_sessions SET status = "submitted", submitted_at = ? WHERE id = ?'
+      ).bind(now, sessionId),
+      db.prepare(
+        `INSERT OR REPLACE INTO simulasi_submissions 
+         (id, student_id, package_id, score_mcq, score_essay, answers_json, analysis_json, submitted_at) 
+         VALUES (?, ?, ?, 0, NULL, ?, ?, ?)`
+      ).bind(
+        submissionId,
+        studentId,
+        packageId,
+        JSON.stringify({}),
+        JSON.stringify(analysis),
+        now
+      )
+    ]);
+
+    session.status = 'submitted';
+    session.submitted_at = now;
+  }
+  return session;
+}
+
 // ==========================================
 // PORTAL PESERTA (STUDENT PORTAL)
 // ==========================================
+
+// 0. Ambil Daftar Paket Simulasi Siswa (Aman): GET /api/simulasi/packages/:studentId
+simulasi.get('/packages/:studentId', async (c) => {
+  try {
+    const studentId = c.req.param('studentId');
+
+    const { results } = await c.env.DB.prepare(
+      'SELECT id, title, subject, duration, questions_count, scheduled_start, scheduled_end, participants_json, discussion_open FROM packages WHERE app_type = "simulasi" AND is_active = 1 AND scheduled_start IS NOT NULL'
+    ).all();
+
+    const filteredResults = results.filter(pkg => {
+      try {
+        const participants = JSON.parse(pkg.participants_json || '[]');
+        return participants.includes(studentId);
+      } catch (e) {
+        return false;
+      }
+    }).map(pkg => {
+      const { participants_json, ...rest } = pkg;
+      return rest;
+    });
+
+    return c.json(filteredResults, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal memuat paket simulasi siswa', details: err.message }, 500);
+  }
+});
 
 // 1. Mulai Ujian: POST /api/simulasi/start
 simulasi.post('/start', async (c) => {
@@ -64,8 +145,7 @@ simulasi.post('/start', async (c) => {
 simulasi.get('/session/:sessionId', async (c) => {
   try {
     const sessionId = c.req.param('sessionId');
-
-    const session = await c.env.DB.prepare(
+    let session = await c.env.DB.prepare(
       `SELECT ss.id, ss.student_id, ss.package_id, ss.status, ss.tab_switch_count, ss.started_at, p.duration, p.title
        FROM simulasi_sessions ss
        JOIN packages p ON ss.package_id = p.id
@@ -75,6 +155,8 @@ simulasi.get('/session/:sessionId', async (c) => {
     if (!session) {
       return c.json({ error: 'Sesi ujian tidak ditemukan' }, 404);
     }
+
+    session = await checkAndForceSubmit(c.env.DB, session);
 
     return c.json({ success: true, session }, 200);
   } catch (err) {
@@ -88,12 +170,20 @@ simulasi.get('/questions/:packageId/:sessionId', async (c) => {
     const packageId = c.req.param('packageId');
     const sessionId = c.req.param('sessionId');
 
-    // Pastikan sesi masih aktif/ongoing
-    const session = await c.env.DB.prepare(
-      'SELECT id FROM simulasi_sessions WHERE id = ? AND package_id = ? AND status = "ongoing"'
+    let session = await c.env.DB.prepare(
+      `SELECT ss.id, ss.student_id, ss.package_id, ss.status, ss.started_at, p.duration 
+       FROM simulasi_sessions ss 
+       JOIN packages p ON ss.package_id = p.id 
+       WHERE ss.id = ? AND ss.package_id = ?`
     ).bind(sessionId, packageId).first();
 
     if (!session) {
+      return c.json({ error: 'Sesi tidak ditemukan' }, 404);
+    }
+
+    session = await checkAndForceSubmit(c.env.DB, session);
+
+    if (session.status !== 'ongoing') {
       return c.json({ error: 'Akses ditolak. Sesi tidak aktif atau sudah selesai dikerjakan.' }, 403);
     }
 
@@ -336,11 +426,10 @@ simulasi.post('/chat-isa', async (c) => {
     }
 
     // C. Panggil Gemini API Pro via HTTP Fetch
-    const systemPrompt = 'Anda adalah Isa, asisten virtual ramah untuk platform CBT UMDipo. Tugas Anda membantu menerangkan pembahasan soal simulasi ujian ini secara runut, ramah, dan mendidik. Gunakan format Markdown untuk penulisan matematika / rumus jika diperlukan.';
-    const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${c.env.GEMINI_API_KEY}`;
+    const systemInstructionText = 'Kamu adalah Isa, seorang tutor pendamping belajar yang santai, bersahabat, dan suportif untuk membantu peserta memahami pembahasan soal ujian. Jangan sebutkan kata "Gemini", "Google", "AI", atau "Asisten Virtual" di dalam penjelasanmu. Cukup panggil dirimu sebagai "Isa". Gunakan bahasa Indonesia yang santai, akrab, ramah, dan tidak formal/kaku (seperti mengobrol dengan teman dekat atau kakak tutor). PENTING: Jangan pernah menggunakan kata "Anda"! Selalu gunakan kata "kamu" untuk menyapa pengguna. Gunakan format Markdown untuk penulisan matematika / rumus jika diperlukan.';
+    const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${c.env.GEMINI_API_KEY}`;
 
     const contents = [
-      { role: 'user', parts: [{ text: systemPrompt }] },
       ...messages.map(m => ({
         role: m.sender === 'user' ? 'user' : 'model',
         parts: [{ text: m.text }]
@@ -351,7 +440,12 @@ simulasi.post('/chat-isa', async (c) => {
     const response = await fetch(geminiEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents })
+      body: JSON.stringify({
+        contents,
+        systemInstruction: {
+          parts: [{ text: systemInstructionText }]
+        }
+      })
     });
 
     const data = await response.json();
@@ -391,7 +485,7 @@ simulasi.post('/chat-isa', async (c) => {
 simulasi.get('/admin/packages', async (c) => {
   try {
     const { results } = await c.env.DB.prepare(
-      'SELECT id, title, subject, duration, questions_count, is_active, scheduled_start, scheduled_end, discussion_open FROM packages WHERE app_type = "simulasi"'
+      'SELECT id, title, subject, duration, questions_count, is_active, scheduled_start, scheduled_end, discussion_open, participants_json FROM packages WHERE app_type = "simulasi"'
     ).all();
 
     return c.json(results, 200);
@@ -413,6 +507,34 @@ simulasi.patch('/admin/packages/:id/schedule', async (c) => {
     return c.json({ success: true }, 200);
   } catch (err) {
     return c.json({ error: 'Gagal memperbarui jadwal', details: err.message }, 500);
+  }
+});
+
+// 7b. Edit Jadwal & Peserta Ujian: PATCH /api/simulasi/admin/packages/:id/schedule-participants
+simulasi.patch('/admin/packages/:id/schedule-participants', async (c) => {
+  try {
+    const packageId = c.req.param('id');
+    const { scheduledStart, participants } = await c.req.json(); // scheduledStart: UNIX timestamp or null, participants: array of student ids
+
+    await c.env.DB.prepare(
+      'UPDATE packages SET scheduled_start = ?, scheduled_end = NULL, participants_json = ? WHERE id = ? AND app_type = "simulasi"'
+    ).bind(scheduledStart, JSON.stringify(participants || []), packageId).run();
+
+    return c.json({ success: true }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal memperbarui jadwal dan peserta', details: err.message }, 500);
+  }
+});
+
+// 7c. Ambil Daftar Siswa Pro2: GET /api/simulasi/admin/students
+simulasi.get('/admin/students', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(
+      "SELECT id, nama, nomor_wa, email FROM students WHERE tier = 'pro2' ORDER BY nama ASC"
+    ).all();
+    return c.json(results, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal memuat data siswa', details: err.message }, 500);
   }
 });
 
@@ -438,14 +560,30 @@ simulasi.get('/admin/sessions/:packageId', async (c) => {
     const packageId = c.req.param('packageId');
 
     const { results } = await c.env.DB.prepare(
-      `SELECT s.nama, s.nomor_wa, ss.status, ss.tab_switch_count, ss.started_at, ss.submitted_at
+      `SELECT ss.id, ss.student_id, ss.package_id, ss.status, ss.tab_switch_count, ss.started_at, ss.submitted_at, s.nama, s.nomor_wa, p.duration
        FROM simulasi_sessions ss
        JOIN students s ON ss.student_id = s.id
+       JOIN packages p ON ss.package_id = p.id
        WHERE ss.package_id = ?
        ORDER BY ss.started_at DESC`
     ).bind(packageId).all();
 
-    return c.json(results, 200);
+    const processedResults = [];
+    for (let s of results) {
+      if (s.status === 'ongoing') {
+        s = await checkAndForceSubmit(c.env.DB, s);
+      }
+      processedResults.push({
+        nama: s.nama,
+        nomor_wa: s.nomor_wa,
+        status: s.status,
+        tab_switch_count: s.tab_switch_count,
+        started_at: s.started_at,
+        submitted_at: s.submitted_at
+      });
+    }
+
+    return c.json(processedResults, 200);
   } catch (err) {
     return c.json({ error: 'Gagal memuat log live monitoring', details: err.message }, 500);
   }
@@ -455,6 +593,20 @@ simulasi.get('/admin/sessions/:packageId', async (c) => {
 simulasi.get('/admin/submissions/:packageId', async (c) => {
   try {
     const packageId = c.req.param('packageId');
+
+    // Force submit all expired sessions first
+    const sessions = await c.env.DB.prepare(
+      `SELECT ss.id, ss.student_id, ss.package_id, ss.status, ss.started_at, p.duration
+       FROM simulasi_sessions ss
+       JOIN packages p ON ss.package_id = p.id
+       WHERE ss.package_id = ? AND ss.status = "ongoing"`
+    ).bind(packageId).all();
+
+    if (sessions.results && sessions.results.length > 0) {
+      for (const s of sessions.results) {
+        await checkAndForceSubmit(c.env.DB, s);
+      }
+    }
 
     const { results } = await c.env.DB.prepare(
       `SELECT s.nama, s.nomor_wa, s.email, sub.score_mcq, sub.score_essay, sub.answers_json, sub.submitted_at
