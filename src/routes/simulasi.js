@@ -39,8 +39,8 @@ async function checkAndForceSubmit(db, session) {
       ).bind(now, sessionId),
       db.prepare(
         `INSERT OR REPLACE INTO simulasi_submissions 
-         (id, student_id, package_id, schedule_id, score_mcq, score_essay, answers_json, analysis_json, submitted_at) 
-         VALUES (?, ?, ?, ?, 0, NULL, ?, ?, ?)`
+         (id, student_id, package_id, schedule_id, score_mcq, score_essay, answers_json, analysis_json, essay_grades_json, submitted_at) 
+         VALUES (?, ?, ?, ?, 0, NULL, ?, ?, '{}', ?)`
       ).bind(
         submissionId,
         studentId,
@@ -261,6 +261,7 @@ simulasi.post('/violation', async (c) => {
 });
 
 // 4. Kirim Ujian & Penilaian Pilihan Ganda: POST /api/simulasi/submit
+// 4. Kirim Ujian & Penilaian Pilihan Ganda & Essay: POST /api/simulasi/submit
 simulasi.post('/submit', async (c) => {
   try {
     const { studentId, scheduleId, sessionId, answers } = await c.req.json();
@@ -276,7 +277,7 @@ simulasi.post('/submit', async (c) => {
        FROM simulasi_schedules s
        JOIN packages p ON s.package_id = p.id
        WHERE s.id = ?`
-    ).bind(scheduleId).first();
+     ).bind(scheduleId).first();
 
     if (!schedule) {
       return c.json({ error: 'Jadwal simulasi tidak ditemukan' }, 404);
@@ -285,9 +286,13 @@ simulasi.post('/submit', async (c) => {
     const questions = JSON.parse(schedule.questions_json || '[]');
     let correctMcqCount = 0;
     let totalMcqCount = 0;
+    let correctEssayCount = 0;
+    let totalEssayCount = 0;
+    const essayGrades = {};
+    let hasAutoGradableEssay = false;
     const analysis = {}; // Akurasi per subtopik: { [subtopic]: { correct: 0, total: 0 } }
 
-    // B. Hitung skor MCQ dan kumpulkan analisis subtopik
+    // B. Hitung skor MCQ dan Essay
     questions.forEach((q) => {
       const subtopic = q.subtopic || 'Umum';
       const isMcq = q.type === 'mcq' || !q.type;
@@ -304,10 +309,45 @@ simulasi.post('/submit', async (c) => {
           correctMcqCount += 1;
           analysis[subtopic].correct += 1;
         }
+      } else if (q.type === 'essay') {
+        let referenceKey = q.explanation || '';
+        let isAutoGradable = false;
+        
+        if (referenceKey.toUpperCase().startsWith('JAWABAN -')) {
+          referenceKey = referenceKey.substring(referenceKey.indexOf('-') + 1).trim();
+          isAutoGradable = true;
+        }
+        
+        if (isAutoGradable && referenceKey) {
+          hasAutoGradableEssay = true;
+          totalEssayCount += 1;
+          
+          const cleanStudent = studentAnswer.toString().toUpperCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").replace(/\s+/g, " ").trim();
+          const cleanKey = referenceKey.toUpperCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").replace(/\s+/g, " ").trim();
+          
+          const isCorrect = cleanStudent === cleanKey;
+          const score = isCorrect ? 100 : 0;
+          
+          if (isCorrect) {
+            correctEssayCount += 1;
+            analysis[subtopic].correct += 1;
+          }
+          
+          essayGrades[q.id] = {
+            score: score,
+            feedback: isCorrect ? 'Kecocokan Otomatis 100%' : 'Kecocokan Otomatis 0% (Jawaban tidak cocok)'
+          };
+        }
       }
     });
 
     const scoreMcq = totalMcqCount > 0 ? (correctMcqCount / totalMcqCount) * 100 : 0;
+    
+    let scoreEssay = null;
+    if (hasAutoGradableEssay && totalEssayCount > 0) {
+      scoreEssay = (correctEssayCount / totalEssayCount) * 100;
+    }
+
     const submissionId = `${studentId}_${scheduleId}`;
 
     // C. Simpan ke Database (Batch Transaction)
@@ -319,16 +359,18 @@ simulasi.post('/submit', async (c) => {
       // Simpan berkas hasil ujian
       c.env.DB.prepare(
         `INSERT OR REPLACE INTO simulasi_submissions 
-         (id, student_id, package_id, schedule_id, score_mcq, score_essay, answers_json, analysis_json, submitted_at) 
-         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+         (id, student_id, package_id, schedule_id, score_mcq, score_essay, answers_json, analysis_json, essay_grades_json, submitted_at) 
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         submissionId,
         studentId,
         schedule.package_id,
         scheduleId,
         scoreMcq,
+        scoreEssay,
         JSON.stringify(answers),
         JSON.stringify(analysis),
+        JSON.stringify(essayGrades),
         now
       )
     ]);
@@ -336,6 +378,7 @@ simulasi.post('/submit', async (c) => {
     return c.json({
       success: true,
       scoreMcq,
+      scoreEssay,
       analysis
     }, 200);
 
@@ -351,7 +394,7 @@ simulasi.get('/submission/:scheduleId/:studentId', async (c) => {
     const studentId = c.req.param('studentId');
 
     const submission = await c.env.DB.prepare(
-      `SELECT sub.score_mcq, sub.score_essay, sub.answers_json, sub.analysis_json, sub.submitted_at,
+      `SELECT sub.score_mcq, sub.score_essay, sub.essay_grades_json, sub.answers_json, sub.analysis_json, sub.submitted_at,
               ss.id AS session_id
        FROM simulasi_submissions sub
        JOIN simulasi_sessions ss ON ss.schedule_id = sub.schedule_id AND ss.student_id = sub.student_id
@@ -736,6 +779,7 @@ simulasi.get('/admin/sessions/:scheduleId', async (c) => {
         s = await checkAndForceSubmit(c.env.DB, s);
       }
       processedResults.push({
+        student_id: s.student_id,
         nama: s.nama,
         nomor_wa: s.nomor_wa,
         status: s.status,
@@ -781,6 +825,76 @@ simulasi.get('/admin/submissions/:scheduleId', async (c) => {
     return c.json(results, 200);
   } catch (err) {
     return c.json({ error: 'Gagal mengekstrak hasil nilai simulasi', details: err.message }, 500);
+  }
+});
+
+// 14. Detail Pengerjaan Soal Essay Siswa (Untuk Nilai Admin): GET /api/simulasi/admin/submission-details/:scheduleId/:studentId
+simulasi.get('/admin/submission-details/:scheduleId/:studentId', async (c) => {
+  try {
+    const scheduleId = c.req.param('scheduleId');
+    const studentId = c.req.param('studentId');
+
+    const submission = await c.env.DB.prepare(
+      `SELECT sub.id, sub.answers_json, sub.essay_grades_json, sub.score_essay, p.questions_json, st.nama
+       FROM simulasi_submissions sub
+       JOIN packages p ON sub.package_id = p.id
+       JOIN students st ON sub.student_id = st.id
+       WHERE sub.schedule_id = ? AND sub.student_id = ?`
+    ).bind(scheduleId, studentId).first();
+
+    if (!submission) {
+      return c.json({ error: 'Detail pengerjaan tidak ditemukan' }, 404);
+    }
+
+    const questions = JSON.parse(submission.questions_json || '[]');
+    const studentAnswers = JSON.parse(submission.answers_json || '{}');
+    const essayGrades = JSON.parse(submission.essay_grades_json || '{}');
+
+    // Filter only essay questions
+    const essayQuestions = questions.filter(q => q.type === 'essay').map(q => ({
+      id: q.id,
+      question_text: q.question_text,
+      explanation: q.explanation,
+      audio_url: q.audio_url
+    }));
+
+    return c.json({
+      success: true,
+      studentName: submission.nama,
+      submissionId: submission.id,
+      essayQuestions,
+      studentAnswers,
+      existingGrades: essayGrades,
+      scoreEssay: submission.score_essay
+    }, 200);
+
+  } catch (err) {
+    return c.json({ error: 'Gagal mengambil detail pengerjaan esai', details: err.message }, 500);
+  }
+});
+
+// 15. Simpan Penilaian Manual Essay Admin: POST /api/simulasi/admin/grade-essay
+simulasi.post('/admin/grade-essay', async (c) => {
+  try {
+    const { submissionId, scoreEssay, essayGrades } = await c.req.json();
+
+    if (!submissionId || scoreEssay === undefined || !essayGrades) {
+      return c.json({ error: 'Payload penilaian tidak lengkap' }, 400);
+    }
+
+    await c.env.DB.prepare(
+      `UPDATE simulasi_submissions 
+       SET score_essay = ?, essay_grades_json = ? 
+       WHERE id = ?`
+    ).bind(
+      scoreEssay,
+      JSON.stringify(essayGrades),
+      submissionId
+    ).run();
+
+    return c.json({ success: true, message: 'Penilaian esai berhasil disimpan' }, 200);
+  } catch (err) {
+    return c.json({ error: 'Gagal menyimpan penilaian esai', details: err.message }, 500);
   }
 });
 
