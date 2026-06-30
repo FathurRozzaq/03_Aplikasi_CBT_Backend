@@ -58,6 +58,31 @@ async function checkAndForceSubmit(db, session) {
   return session;
 }
 
+// Helper to calculate Levenshtein distance at the word level for essay tolerance grading
+function getWordLevenshteinDistance(words1, words2) {
+  const m = words1.length;
+  const n = words2.length;
+  const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (words1[i - 1] === words2[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      } else {
+        dp[i][j] = Math.min(
+          dp[i - 1][j] + 1,    // deletion
+          dp[i][j - 1] + 1,    // insertion
+          dp[i - 1][j - 1] + 1 // substitution
+        );
+      }
+    }
+  }
+  return dp[m][n];
+}
+
 // ==========================================
 // PORTAL PESERTA (STUDENT PORTAL)
 // ==========================================
@@ -286,7 +311,7 @@ simulasi.post('/submit', async (c) => {
     const questions = JSON.parse(schedule.questions_json || '[]');
     let correctMcqCount = 0;
     let totalMcqCount = 0;
-    let correctEssayCount = 0;
+    let totalEssayScoreSum = 0;
     let totalEssayCount = 0;
     const essayGrades = {};
     let hasAutoGradableEssay = false;
@@ -325,17 +350,37 @@ simulasi.post('/submit', async (c) => {
           const cleanStudent = studentAnswer.toString().toUpperCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").replace(/\s+/g, " ").trim();
           const cleanKey = referenceKey.toUpperCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "").replace(/\s+/g, " ").trim();
           
-          const isCorrect = cleanStudent === cleanKey;
-          const score = isCorrect ? 100 : 0;
+          let score = 0;
+          let feedback = '';
           
-          if (isCorrect) {
-            correctEssayCount += 1;
-            analysis[subtopic].correct += 1;
+          if (cleanStudent === cleanKey) {
+            score = 100;
+            feedback = 'Kecocokan Otomatis 100%';
+          } else if (!cleanStudent) {
+            score = 0;
+            feedback = 'Koreksi Otomatis: 0% cocok (Tidak menjawab)';
+          } else {
+            const studentWords = cleanStudent.split(' ').filter(w => w.length > 0);
+            const keyWords = cleanKey.split(' ').filter(w => w.length > 0);
+            const maxLen = Math.max(studentWords.length, keyWords.length);
+            
+            if (maxLen > 0) {
+              const distance = getWordLevenshteinDistance(studentWords, keyWords);
+              const similarity = 1 - distance / maxLen;
+              score = Math.round(Math.max(0, similarity * 100));
+              feedback = `Koreksi Otomatis: ${score}% cocok (toleransi kemiripan kata)`;
+            } else {
+              score = 0;
+              feedback = 'Koreksi Otomatis: 0% cocok';
+            }
           }
+          
+          totalEssayScoreSum += score;
+          analysis[subtopic].correct += score / 100;
           
           essayGrades[q.id] = {
             score: score,
-            feedback: isCorrect ? 'Kecocokan Otomatis 100%' : 'Kecocokan Otomatis 0% (Jawaban tidak cocok)'
+            feedback: feedback
           };
         }
       }
@@ -345,7 +390,7 @@ simulasi.post('/submit', async (c) => {
     
     let scoreEssay = null;
     if (hasAutoGradableEssay && totalEssayCount > 0) {
-      scoreEssay = (correctEssayCount / totalEssayCount) * 100;
+      scoreEssay = totalEssayScoreSum / totalEssayCount;
     }
 
     const submissionId = `${studentId}_${scheduleId}`;
